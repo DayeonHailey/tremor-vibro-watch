@@ -270,7 +270,39 @@ static void pollSerial() {
 }
 
 // ---------------------------------------------------------------------------
+// 전원 표시 LED (XIAO nRF52840 RGB LED는 active-LOW)
+//   USB 연결(VBUS 감지)  → 초록 ON
+//   배터리만 연결        → 파랑 ON
+static void powerLedInit() {
+    pinMode(LED_RED, OUTPUT);
+    pinMode(LED_GREEN, OUTPUT);
+    pinMode(LED_BLUE, OUTPUT);
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_BLUE, HIGH);
+    // 부팅 표시: 빨강 3회 깜빡임
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_RED, LOW);  delay(150);
+        digitalWrite(LED_RED, HIGH); delay(150);
+    }
+}
+
+static void powerLedUpdate() {
+    static uint32_t last_ms = 0;
+    static int8_t   last_usb = -1;
+    const uint32_t now = millis();
+    if (now - last_ms < 500) return;
+    last_ms = now;
+
+    const bool usb = (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+    if (usb == last_usb) return;
+    last_usb = usb;
+    digitalWrite(LED_GREEN, usb ? LOW : HIGH);
+    digitalWrite(LED_BLUE,  usb ? HIGH : LOW);
+}
+
 void setup() {
+    powerLedInit();
     // USB 없이 배터리로 켜도 멈추지 않도록 Serial 연결을 기다리지 않는다
     Serial.begin(kSerialBaud);
 
@@ -285,6 +317,7 @@ void setup() {
 }
 
 void loop() {
+    powerLedUpdate();
     pollSerial();
 
     if (micros() - last_sample_us < kPollGuardUs) return;
