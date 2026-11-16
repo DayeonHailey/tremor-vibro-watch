@@ -1,100 +1,80 @@
 #include "haptic_driver.h"
-#include <Wire.h>
-#include "config.h" // I2C 핀 번호나 기타 설정이 필요할 경우 
 #include <Arduino.h>
+#include <Wire.h>
+#include "config.h"
 
-// --- DRV2605L I2C 주소 및 주요 레지스터 맵 ---
-#define DRV2605_ADDR        0x5A 
+// --- DRV2605L 레지스터 맵 ---
 #define REG_MODE            0x01
 #define REG_RTPIN           0x02
 #define REG_LIBSEL          0x03
-#define REG_RATEDV          0x16
-#define REG_LRARESON        0x22
+#define REG_OD_CLAMP        0x17   // 구동 전압 상한
+#define REG_FEEDBACK        0x1A   // bit7 N_ERM_LRA
 #define REG_CONTROL3        0x1D
+#define REG_OL_LRA_PERIOD   0x20   // open-loop LRA 구동 주기 (0x22는 읽기 전용이라 쓰지 않음)
 
-// --- 튜닝 파라미터 ---
-const float TREMOR_THRESHOLD = 0.5;   
-const float MAX_RMS_EXPECTED = 3.0;   
-const unsigned long RTP_UPDATE_PERIOD = 100; // 진동 세기 유지/업데이트 주기 (100ms)
+#define MODE_RTP            0x05
+#define MODE_STANDBY_RTP    0x45   // bit6 STANDBY + RTP 모드 유지
 
-// 매크로 함수
-#define CALC_RATED_VOLTAGE(vrms)  (uint8_t)((vrms) * 255.0 / 5.3)
-#define CALC_LRA_FREQ(hz)         (uint8_t)(1.0 / ((hz) * 0.00009846))
+// OL_LRA_PERIOD: 주기 = 값 × 98.46 us
+#define CALC_LRA_PERIOD(hz) (uint8_t)(1.0f / ((hz) * 0.00009846f))
 
-// --- 내부 상태 관리 변수 ---
-static bool is_standby = false; 
-static int brake_counter = 0; // 
-static unsigned long last_rtp_update_time = 0; // 마지막 진동 업데이트 시간
+// 구동 전압 상한 1.8 V. OD_CLAMP 환산식 21.96 mV/LSB (§13-4, 데이터시트로 최종 확인 필요)
+// → 1800 / 21.96 = 81.97 ≈ 82 (0x52, 1.80 V)
+constexpr float   kVoltageLimitV = 1.8f;
+constexpr uint8_t kOdClamp = (uint8_t)(kVoltageLimitV * 1000.0f / 21.96f + 0.5f);
 
-// --- I2C Register Write 헬퍼 함수 ---
+enum class DrvState : uint8_t { STANDBY, ACTIVE, BRAKING };
+
+static DrvState state = DrvState::STANDBY;
+static uint32_t brake_start_ms = 0;
+
 static void writeRegister8(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(DRV2605_ADDR);
+    Wire.beginTransmission(kDrv2605Addr);
     Wire.write(reg);
     Wire.write(val);
     Wire.endTransmission();
 }
 
 void Haptic_Init() {
-    Wire.begin(); // Custom PCB의 I2C 핀이 다를 경우 Wire.begin(SDA_PIN, SCL_PIN) 으로 수정 필요
+    pinMode(DRV_EN_PIN, OUTPUT);
+    digitalWrite(DRV_EN_PIN, HIGH);
+    delay(10);
+
+    Wire.begin();
     delay(10);    // IC 부팅 대기
 
-    // 1. Standby 모드 해제 및 초기화
-    writeRegister8(REG_MODE, 0x00); 
-    
-    // 2. LRA 라이브러리(6) 선택
-    writeRegister8(REG_LIBSEL, 0x06); 
-    
-    // 3. 저전력 Open-loop 및 구동 파라미터 설정
-    writeRegister8(REG_CONTROL3, 0x01); // LRA_OPEN_LOOP 활성화
-    writeRegister8(REG_LRARESON, CALC_LRA_FREQ(170)); // 170Hz 타겟
-    writeRegister8(REG_RATEDV, CALC_RATED_VOLTAGE(1.8)); // 1.8V 전압 제한
+    writeRegister8(REG_MODE, 0x00);                  // standby 해제
+    writeRegister8(REG_FEEDBACK, 0x80 | 0x06);       // LRA 모드
+    writeRegister8(REG_LIBSEL, 0x06);                // LRA 라이브러리
+    writeRegister8(REG_CONTROL3, 0x01);              // LRA_OPEN_LOOP, RTP signed
+    writeRegister8(REG_OD_CLAMP, kOdClamp);
+    writeRegister8(REG_OL_LRA_PERIOD, CALC_LRA_PERIOD(170));
 
-    // 4. 초기 상태: 제동(0) 및 Standby 진입
-    writeRegister8(REG_MODE, 0x05); // RTP 모드 (0x05)
-    writeRegister8(REG_RTPIN, 0x00); // 진동 0
-    writeRegister8(REG_MODE, 0x40); // Standby 비트(bit 6) 설정으로 초저전력 모드 진입
-    is_standby = true;
+    writeRegister8(REG_MODE, MODE_RTP);
+    writeRegister8(REG_RTPIN, 0x00);
+    writeRegister8(REG_MODE, MODE_STANDBY_RTP);
+    state = DrvState::STANDBY;
 }
 
-void Haptic_Set_Vibration(float rms_value) {
-    unsigned long current_time = millis();
-
-    if (rms_value >= TREMOR_THRESHOLD) {
-        // [1] Standby 해제 (모터 깨우기)
-        if (is_standby) {
-            writeRegister8(REG_MODE, 0x05); // RTP 모드로 복귀
-            is_standby = false;
-        }
-        
-        brake_counter = 0; // 브레이크 초기화
-
-        // [2] 진동 세기 유지 시간 확인 (100ms마다만 업데이트)
-        if (current_time - last_rtp_update_time >= RTP_UPDATE_PERIOD) {
-            last_rtp_update_time = current_time;
-
-            long rtp_value = map((long)(rms_value * 100), 
-                                 (long)(TREMOR_THRESHOLD * 100), 
-                                 (long)(MAX_RMS_EXPECTED * 100), 
-                                 13, 127);
-                                 
-            if (rtp_value > 127) rtp_value = 127;
-            if (rtp_value < 13) rtp_value = 13;
-
-            writeRegister8(REG_RTPIN, (uint8_t)rtp_value);
-        }
-    } 
-    else {
-        // [3] Active Brake 및 Standby 진입 로직
-        if (!is_standby) {
-            writeRegister8(REG_RTPIN, 0x00); // Active Brake 시작
-            
-            // main 루프가 10ms(100Hz)마다 호출된다고 가정할 때, 10번(100ms) 유지
-            brake_counter++;
-            
-            if (brake_counter >= 10) {
-                writeRegister8(REG_MODE, 0x40); // Standby 진입
-                is_standby = true;
-            }
-        }
+void Haptic_Drive(bool on) {
+    if (on) {
+        if (state == DrvState::ACTIVE) return;
+        if (state == DrvState::STANDBY) writeRegister8(REG_MODE, MODE_RTP);
+        writeRegister8(REG_RTPIN, kVibLevel);
+        state = DrvState::ACTIVE;
+        return;
     }
+
+    if (state == DrvState::ACTIVE) {
+        writeRegister8(REG_RTPIN, 0x00);   // 제동 시작
+        brake_start_ms = millis();
+        state = DrvState::BRAKING;
+    } else if (state == DrvState::BRAKING && millis() - brake_start_ms >= kBrakeMs) {
+        writeRegister8(REG_MODE, MODE_STANDBY_RTP);
+        state = DrvState::STANDBY;
+    }
+}
+
+bool Haptic_IsActive() {
+    return state == DrvState::ACTIVE;
 }
