@@ -17,6 +17,8 @@ constexpr float kPeakRatio = 0.9f;
 // 증분 합에 들고 난 에너지가 창 에너지의 이 배를 넘으면 lap 전이라도 재합산한다.
 // 큰 신호가 빠져나간 직후 작은 신호 기준으로 float 상쇄 오차가 커지는 것을 막는다.
 constexpr float kChurnLimit = 16.0f;
+// churn 한계를 넘었을 때 샘플당 재합산할 lag 수 (lag 29개면 약 8샘플에 한 바퀴)
+constexpr int kBurstRefresh = 4;
 
 bool inRange(float v, float lo, float hi) { return v >= lo && v <= hi; }   // NaN은 거부
 
@@ -192,7 +194,7 @@ void TremorGate::reset() {
     rms_sum_ = 0.0f;
     rms_lap_ = 0;
     acf_churn_ = 0.0f;
-    acf_lap_ = 0;
+    acf_rr_ = lag_lo_;
     s1_ = s2_ = s3r_ = s3d_ = false;
     gate_ = false;
     run_ = 0;
@@ -226,10 +228,10 @@ const GateOutput& TremorGate::update(const Vec3& g) {
     const float z = bp_[2].process(g.z);
     const float e = x * x + y * y + z * z;
     pos_ = (pos_ + 1 == kRing) ? 0 : pos_ + 1;
-    hx_[pos_] = x;
-    hy_[pos_] = y;
-    hz_[pos_] = z;
-    he_[pos_] = e;
+    hx_[pos_] = hx_[pos_ + kRing] = x;
+    hy_[pos_] = hy_[pos_ + kRing] = y;
+    hz_[pos_] = hz_[pos_ + kRing] = z;
+    he_[pos_] = he_[pos_ + kRing] = e;
     mark(0);
 
     // --- Stage 1: 스펙트럼 집중도 (§4.4) ---
@@ -296,11 +298,41 @@ const GateOutput& TremorGate::update(const Vec3& g) {
     return out_;
 }
 
-void TremorGate::recomputeAcf() {
-    for (int k = lag_lo_; k <= lag_hi_; ++k) {
-        float s = 0.0f;
-        for (int j = 0; j + k < N_; ++j) s += dotBack(j, j + k);
-        lag_sum_[k] = s;
+float TremorGate::lagExact(int k) const {
+    // 창 안의 곱 x[n−j]·x[n−j−k], j = 0..N−k−1 을 미러 버퍼에서 연속 구간으로 합산.
+    // back b 샘플은 인덱스 pos_ + kRing − b.
+    const int len = N_ - k;
+    const int hi = pos_ + kRing;   // back 0
+    const int lo = hi - (len - 1);  // back len−1
+    const float* ax = &hx_[lo];
+    const float* ay = &hy_[lo];
+    const float* az = &hz_[lo];
+    const float* bx = ax - k;
+    const float* by = ay - k;
+    const float* bz = az - k;
+    // 누적기 4개로 의존성 체인을 끊는다 (FPU 파이프라인 활용)
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int i = 0;
+    for (; i + 1 < len; i += 2) {
+        s0 += ax[i] * bx[i] + ay[i] * by[i];
+        s1 += az[i] * bz[i];
+        s2 += ax[i + 1] * bx[i + 1] + ay[i + 1] * by[i + 1];
+        s3 += az[i + 1] * bz[i + 1];
+    }
+    if (i < len) s0 += ax[i] * bx[i] + ay[i] * by[i] + az[i] * bz[i];
+    return (s0 + s1) + (s2 + s3);
+}
+
+void TremorGate::refreshLags(int n) {
+    // 한꺼번에 전 lag를 재합산하면 그 샘플만 수만 cycle이 걸린다 (T10 최대값의 원인).
+    // 대신 샘플마다 lag 몇 개씩 돌아가며 정확한 값으로 덮어써서 누적 오차를 끊는다.
+    // lag 하나는 (lag_hi − lag_lo + 1)/n 샘플마다 갱신된다.
+    for (int i = 0; i < n; ++i) {
+        lag_sum_[acf_rr_] = lagExact(acf_rr_);
+        if (++acf_rr_ > lag_hi_) {
+            acf_rr_ = lag_lo_;
+            acf_churn_ = 0.0f;   // 한 바퀴 돌았으면 모든 lag가 새 값
+        }
     }
 }
 
@@ -325,11 +357,8 @@ void TremorGate::stage3() {
     }
     const float e_tot = tail;
 
-    if (++acf_lap_ >= N_ || acf_churn_ > kChurnLimit * e_tot) {
-        acf_lap_ = 0;
-        acf_churn_ = 0.0f;
-        recomputeAcf();
-    }
+    // 평소엔 샘플당 1개, 큰 에너지가 들고 나서 상쇄 오차가 커질 수 있으면 빨리 한 바퀴 돈다
+    refreshLags(acf_churn_ > kChurnLimit * e_tot ? kBurstRefresh : 1);
 
     for (int k = lag_lo_; k <= lag_hi_; ++k) {
         const float d = e1_[k] * e2_[k];

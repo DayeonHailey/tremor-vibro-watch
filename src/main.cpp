@@ -4,6 +4,7 @@
 #include <string.h>
 #include "config.h"
 #include "imu_handler.h"
+#include "timebase.h"
 #include "tremor_gate.h"
 #include "haptic_controller.h"
 #include "haptic_driver.h"
@@ -15,15 +16,20 @@
 //   t<0|1>          trial 종료/시작. trial 중에는 m·p를 거부
 //   ?               파라미터와 CSV 헤더 출력
 //   c               사이클 계측 시작 (1만 샘플 후 stage별 min/avg/max 출력, §8)
+//   s               IMU/FIFO 카운터 출력 (seq, overrun, I2C 오류 등)
+//
+// CSV의 t_us는 FIFO 묶음의 마지막 샘플 행에만 있다 (BLE Data 패킷과 같은 의미, BLE_SPEC §3).
 
 static TremorGate gate;
 static HapticController hctrl;
-static uint32_t seq = 0;
-static uint32_t last_sample_us = 0;
 static uint8_t cfg_ver = 0;
 
-// data-ready 폴링을 샘플 주기(9615 us) 직전까지 생략해서 I2C 버스를 비워 둔다
-static constexpr uint32_t kPollGuardUs = 8500;
+// 오류 코드 (BLE_SPEC §7 err_code). 초기화 실패 시 멈추지 않고 1초마다 재시도한다.
+static constexpr uint8_t kErrNone = 0;
+static constexpr uint8_t kErrImuInit = 1;
+static uint8_t err_code = kErrNone;
+static constexpr uint32_t kImuRetryMs = 1000;
+static uint32_t imu_retry_ms = 0;
 
 static const char kCsvHeader[] = "seq,t_us,ax,ay,az,gx,gy,gz,bits,mode,A,C,r,D,f_acf,clip";
 
@@ -64,16 +70,22 @@ struct ProfileStat {
     uint64_t sum;
 };
 static ProfileStat prof[kProfSlots];
+static ProfileStat prof_batch;   // FIFO 확인·읽기 + 4샘플 처리(게이트·햅틱), CSV 제외
+static uint32_t prof_batch_n = 0;
 static uint32_t prof_left = 0;
+static uint16_t prof_overrun0 = 0;
 
 static uint32_t dwtCycles() { return DWT->CYCCNT; }
 
 static void profileStart() {
+    // CYCCNT는 0으로 돌리지 않는다 (차이만 쓰므로 불필요)
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     for (ProfileStat& s : prof) s = ProfileStat{UINT32_MAX, 0, 0};
-    prof_left = kProfileSamples;
+    prof_batch = ProfileStat{UINT32_MAX, 0, 0};
+    prof_overrun0 = imuStats().fifo_overrun;
+    prof_batch_n = 0;
+    prof_left = kProfileSamples;   // 4의 배수 → 묶음 경계에서 끝난다
     gate.setCycleCounter(dwtCycles);
 }
 
@@ -88,7 +100,17 @@ static void profileAccumulate() {
         if (v > s.max) s.max = v;
         s.sum += v;
     }
-    if (--prof_left > 0) return;
+    --prof_left;
+}
+
+// 묶음 처리가 끝날 때마다 호출. 샘플 수를 다 채웠으면 결과를 출력한다.
+static void profileBatch(uint32_t cycles) {
+    ProfileStat& s = prof_batch;
+    if (cycles < s.min) s.min = cycles;
+    if (cycles > s.max) s.max = cycles;
+    s.sum += cycles;
+    ++prof_batch_n;
+    if (prof_left > 0) return;
 
     gate.setCycleCounter(nullptr);
     static const char* const names[kProfSlots] = {"pre", "s1", "s2", "s3", "logic", "total"};
@@ -108,7 +130,18 @@ static void profileAccumulate() {
     }
     Serial.print("# cyc total max = ");
     Serial.print(100.0f * prof[kProfSlots - 1].max / period_cyc, 3);
-    Serial.println(" % of sample period (pass <= 5%)");
+    Serial.println(" % of sample period (gate only)");
+    Serial.print("# cyc batch,");
+    Serial.print(prof_batch.min);
+    Serial.print(',');
+    Serial.print((uint32_t)(prof_batch.sum / prof_batch_n));
+    Serial.print(',');
+    Serial.println(prof_batch.max);
+    Serial.print("# T10b batch max = ");
+    Serial.print(100.0f * prof_batch.max / (period_cyc * kSamplesPerBatch), 3);
+    Serial.print(" % of batch period (pass < 5%), fifo_overrun during run = ");
+    Serial.print(imuStats().fifo_overrun - prof_overrun0);
+    Serial.println(" (pass 0)");
 }
 
 // ---------------------------------------------------------------------------
@@ -150,17 +183,24 @@ static char* appendFloat(char* p, float f, int decimals) {
     return p;
 }
 
-static void printCsv(uint32_t t_us, const ImuSample& s, const GateOutput& g, uint8_t bits) {
+// has_t: 묶음의 마지막 샘플만 t_us를 쓴다 (나머지는 빈칸)
+static void printCsv(uint32_t seq, bool has_t, uint32_t t_us, const ImuRaw& s, const GateOutput& g,
+                     uint8_t bits) {
     char buf[160];
     char* p = buf;
     p = appendU32(p, seq);            *p++ = ',';
-    p = appendU32(p, t_us);           *p++ = ',';
-    p = appendFloat(p, s.ax, 4);      *p++ = ',';
-    p = appendFloat(p, s.ay, 4);      *p++ = ',';
-    p = appendFloat(p, s.az, 4);      *p++ = ',';
-    p = appendFloat(p, s.gx, 3);      *p++ = ',';
-    p = appendFloat(p, s.gy, 3);      *p++ = ',';
-    p = appendFloat(p, s.gz, 3);      *p++ = ',';
+    if (has_t) p = appendU32(p, t_us);
+    *p++ = ',';
+    for (int k = 0; k < 3; ++k) {
+        p = appendFloat(p, imuAccelG(s.a[k]), 4);
+        *p++ = ',';
+    }
+    bool clipped = false;
+    for (int k = 0; k < 3; ++k) {
+        p = appendFloat(p, imuGyroDps(s.g[k]), 3);
+        *p++ = ',';
+        clipped = clipped || imuIsClipped(s.g[k]) || imuIsClipped(s.a[k]);
+    }
     p = appendU32(p, bits);           *p++ = ',';
     p = appendU32(p, (uint8_t)hctrl.mode()); *p++ = ',';
     p = appendFloat(p, g.A, 3);       *p++ = ',';
@@ -168,7 +208,7 @@ static void printCsv(uint32_t t_us, const ImuSample& s, const GateOutput& g, uin
     p = appendFloat(p, g.r, 3);       *p++ = ',';
     p = appendFloat(p, g.D, 3);       *p++ = ',';
     p = appendFloat(p, g.f_acf, 2);   *p++ = ',';
-    *p++ = s.clipped ? '1' : '0';
+    *p++ = clipped ? '1' : '0';
     *p++ = '\r';
     *p++ = '\n';
     Serial.write((const uint8_t*)buf, p - buf);
@@ -198,6 +238,21 @@ static void printParams() {
 static void reply(bool ok, const char* line) {
     Serial.print(ok ? "# ok " : "# err ");
     Serial.println(line);
+}
+
+static void printStats() {
+    const ImuStats& s = imuStats();
+    Serial.print("# stats t_us=");          Serial.print(timebase_us());
+    Serial.print(" seq_now=");              Serial.print(imuNextSeq());
+    Serial.print(" err_code=");             Serial.print(err_code);
+    Serial.print(" fifo_overrun=");         Serial.print(s.fifo_overrun);
+    Serial.print(" lost_samples=");         Serial.print(s.lost_samples);
+    Serial.print(" i2c_err=");              Serial.print(s.i2c_err);
+    Serial.print(" realign=");              Serial.print(s.realign);
+    Serial.print(" ts_extrap=");            Serial.print(s.ts_extrap);
+    Serial.print(" ts_stale_irq=");         Serial.print(s.ts_stale_irq);
+    Serial.print(" irq_count=");            Serial.print(s.irq_count);
+    Serial.print(" gyro_clip=");            Serial.println(s.gyro_clip);
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +295,10 @@ static void handleLine(char* line) {
             break;
         case 'c':
             profileStart();
-            reply(true, line);
+            reply(true, line);   // 측정 중에는 CSV 출력을 멈춘다
+            break;
+        case 's':
+            printStats();
             break;
         default:
             reply(false, line);
@@ -305,34 +363,62 @@ void setup() {
     powerLedInit();
     // USB 없이 배터리로 켜도 멈추지 않도록 Serial 연결을 기다리지 않는다
     Serial.begin(kSerialBaud);
+    timebase_init();
 
-    if (!initIMU()) {
-        Serial.println("# IMU init failed");
-        while (1) delay(10);
-    }
+    // Haptic_Init()의 Wire.begin()이 I2C 클럭을 100 kHz로 되돌리므로 IMU보다 먼저
     Haptic_Init();
+    if (!imuInit()) {
+        err_code = kErrImuInit;
+        imu_retry_ms = millis();
+        Serial.println("# IMU init failed, retrying every 1 s");
+    }
 
-    Serial.println("# Tremor watch FW (spec v1.1)");
+    Serial.println("# Tremor watch FW (spec v1.1, BLE_SPEC S1: IMU FIFO)");
     printParams();
+}
+
+// profiling: 이 묶음이 계측 대상 (cyc0 = imuPoll 직전 CYCCNT, FIFO 읽기 포함)
+static void processBatch(const ImuBatch& b, bool profiling, uint32_t cyc0) {
+    if (b.discontinuity) gate.reset();   // overrun·재초기화로 샘플이 끊겼다
+
+    GateOutput g[kSamplesPerBatch];
+    uint8_t bits[kSamplesPerBatch];
+    for (int i = 0; i < kSamplesPerBatch; ++i) {
+        const ImuRaw& s = b.s[i];
+        g[i] = gate.update(Vec3{imuGyroDps(s.g[0]), imuGyroDps(s.g[1]), imuGyroDps(s.g[2])});
+        if (prof_left > 0) profileAccumulate();
+        Haptic_Drive(hctrl.decide(g[i]));
+        bits[i] = g[i].bits;
+        if (Haptic_IsActive()) bits[i] |= GateBit::VIB_ON;
+    }
+    if (profiling) profileBatch(dwtCycles() - cyc0);
+
+    if (prof_left == 0) {   // 계측 중에는 CSV를 끈다 (Serial 출력이 시간을 왜곡)
+        for (int i = 0; i < kSamplesPerBatch; ++i) {
+            const bool last = (i == kSamplesPerBatch - 1);
+            printCsv(b.seq0 + i, last, b.t_us, b.s[i], g[i], bits[i]);
+        }
+    }
 }
 
 void loop() {
     powerLedUpdate();
     pollSerial();
 
-    if (micros() - last_sample_us < kPollGuardUs) return;
-    if (!imuDataReady()) return;
-    const uint32_t t_us = micros();
-    const ImuSample s = readIMU();
-    last_sample_us = t_us;
+    if (err_code == kErrImuInit) {
+        Haptic_Drive(false);
+        if (millis() - imu_retry_ms < kImuRetryMs) return;
+        imu_retry_ms = millis();
+        if (!imuInit()) return;
+        err_code = kErrNone;
+        Serial.println("# IMU init ok");
+    }
 
-    const GateOutput& g = gate.update(Vec3{s.gx, s.gy, s.gz});
-    if (prof_left > 0) profileAccumulate();
-
-    Haptic_Drive(hctrl.decide(g));
-    uint8_t bits = g.bits;
-    if (Haptic_IsActive()) bits |= GateBit::VIB_ON;
-
-    printCsv(t_us, s, g, bits);
-    ++seq;
+    ImuBatch b;
+    for (;;) {
+        const bool profiling = prof_left > 0;
+        const uint32_t cyc0 = profiling ? dwtCycles() : 0;
+        if (!imuPoll(&b)) break;
+        processBatch(b, profiling, cyc0);
+    }
 }

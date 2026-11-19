@@ -150,7 +150,8 @@ class TremorGate {
         int i = idx(a), j = idx(b);
         return hx_[i] * hx_[j] + hy_[i] * hy_[j] + hz_[i] * hz_[j];
     }
-    void recomputeAcf();
+    float lagExact(int k) const;   // lag k의 창 내적 합을 처음부터 계산
+    void refreshLags(int n);       // round-robin으로 lag n개를 정확한 값으로 덮어쓴다
     void stage3();
 
     GateParams p_;
@@ -167,8 +168,10 @@ class TremorGate {
     Biquad    nb_[3];     // Stage 1 협대역 (f0, Q = f0/2)
     bool      primed_ = false;
 
-    // 필터 출력 이력 (3축 + 축합 에너지)
-    float hx_[kRing], hy_[kRing], hz_[kRing], he_[kRing];
+    // 필터 출력 이력 (3축 + 축합 에너지).
+    // 같은 값을 [pos_]와 [pos_ + kRing]에 두 번 써서, back b 샘플이 항상
+    // 연속 인덱스 pos_ + kRing − b 에 있게 한다 (내적 루프에서 wrap 제거).
+    float hx_[2 * kRing], hy_[2 * kRing], hz_[2 * kRing], he_[2 * kRing];
     int   pos_ = 0;
 
     // Stage 1
@@ -180,8 +183,8 @@ class TremorGate {
     float lag_sum_[kMaxLag + 1];
     float r_[kMaxLag + 1];
     float e1_[kMaxLag + 1], e2_[kMaxLag + 1];
-    float acf_churn_ = 0.0f;   // 마지막 재합산 이후 들고 난 에너지
-    int   acf_lap_ = 0;
+    float acf_churn_ = 0.0f;   // round-robin 한 바퀴 시작 이후 들고 난 에너지
+    int   acf_rr_ = 0;         // 다음에 재합산할 lag
 
     // 판정
     bool s1_ = false, s2_ = false, s3r_ = false, s3d_ = false;
