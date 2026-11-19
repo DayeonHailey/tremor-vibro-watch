@@ -8,33 +8,41 @@
 #include "tremor_gate.h"
 #include "haptic_controller.h"
 #include "haptic_driver.h"
+#include "icd.h"
+#include "ble_link.h"
 
-// Serial 명령 (줄 단위, 응답은 '#'로 시작해서 CSV와 구분):
-//   m<0|2|3>        모드 (NO_VIB / CONSTANT / ADAPTIVE)
-//   p<필드>=<값>     GateParams 필드 (예: pf0=5.2, ptheta_on=3.1). 성공하면 게이트 리셋
-//   r               게이트 리셋
-//   t<0|1>          trial 종료/시작. trial 중에는 m·p를 거부
-//   ?               파라미터와 CSV 헤더 출력
-//   c               사이클 계측 시작 (1만 샘플 후 stage별 min/avg/max 출력, §8)
-//   s               IMU/FIFO 카운터 출력 (seq, overrun, I2C 오류 등)
+// Serial commands (line based; replies start with '#' to separate them from CSV):
+//   m<0|2|3>        mode (NO_VIB / CONSTANT / ADAPTIVE)
+//   p<field>=<val>  GateParams field (e.g. pf0=5.2, ptheta_on=3.1). Resets the gate on success
+//   r               reset gate
+//   t<0|1>          end/start trial. m and p are rejected during a trial
+//   ?               print parameters and CSV header
+//   c               start cycle profiling (prints per-stage min/avg/max after 10k samples, §8)
+//   s               print IMU/FIFO/BLE counters (seq, overrun, I2C errors, MTU, ...)
 //
-// CSV의 t_us는 FIFO 묶음의 마지막 샘플 행에만 있다 (BLE Data 패킷과 같은 의미, BLE_SPEC §3).
+// t_us in the CSV appears only on the last sample row of each FIFO batch (same meaning as the BLE Data packet, BLE_SPEC §3).
 
 static TremorGate gate;
 static HapticController hctrl;
 static uint8_t cfg_ver = 0;
 
-// 오류 코드 (BLE_SPEC §7 err_code). 초기화 실패 시 멈추지 않고 1초마다 재시도한다.
-static constexpr uint8_t kErrNone = 0;
-static constexpr uint8_t kErrImuInit = 1;
+// Error code (BLE_SPEC §7 err_code). Init failures do not halt; retried every 1 s.
+static constexpr uint8_t kErrNone = icd::ERR_NONE;
+static constexpr uint8_t kErrImuInit = icd::ERR_IMU_INIT;
 static uint8_t err_code = kErrNone;
+static uint64_t device_id = 0;
+
+// MTU exchange completes shortly after connecting, so MTU_LOW is reported only if still low after this time
+static constexpr uint32_t kMtuGraceMs = 2000;
+static bool was_connected = false;
+static uint32_t connected_ms = 0;
 static constexpr uint32_t kImuRetryMs = 1000;
 static uint32_t imu_retry_ms = 0;
 
 static const char kCsvHeader[] = "seq,t_us,ax,ay,az,gx,gy,gz,bits,mode,A,C,r,D,f_acf,clip";
 
 // ---------------------------------------------------------------------------
-// 명령 처리 (전송 수단과 무관. P3에서 BLE write 콜백이 그대로 호출한다)
+// Command handlers (transport-independent; the BLE write path calls the same functions)
 // ---------------------------------------------------------------------------
 bool cmd_set_mode(uint8_t v) {
     CondMode m;
@@ -60,17 +68,17 @@ void cmd_set_trial(bool active) {
 }
 
 // ---------------------------------------------------------------------------
-// 사이클 계측 (DWT CYCCNT)
+// Cycle profiling (DWT CYCCNT)
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kProfileSamples = 10000;
-static constexpr int kProfSlots = TremorGate::kNumStages + 1;   // stage별 + 합계
+static constexpr int kProfSlots = TremorGate::kNumStages + 1;   // per stage + total
 
 struct ProfileStat {
     uint32_t min, max;
     uint64_t sum;
 };
 static ProfileStat prof[kProfSlots];
-static ProfileStat prof_batch;   // FIFO 확인·읽기 + 4샘플 처리(게이트·햅틱), CSV 제외
+static ProfileStat prof_batch;   // FIFO check/read + 4-sample processing (gate, haptics), excluding CSV
 static uint32_t prof_batch_n = 0;
 static uint32_t prof_left = 0;
 static uint16_t prof_overrun0 = 0;
@@ -78,14 +86,14 @@ static uint16_t prof_overrun0 = 0;
 static uint32_t dwtCycles() { return DWT->CYCCNT; }
 
 static void profileStart() {
-    // CYCCNT는 0으로 돌리지 않는다 (차이만 쓰므로 불필요)
+    // CYCCNT is not reset to 0 (only differences are used)
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     for (ProfileStat& s : prof) s = ProfileStat{UINT32_MAX, 0, 0};
     prof_batch = ProfileStat{UINT32_MAX, 0, 0};
     prof_overrun0 = imuStats().fifo_overrun;
     prof_batch_n = 0;
-    prof_left = kProfileSamples;   // 4의 배수 → 묶음 경계에서 끝난다
+    prof_left = kProfileSamples;   // multiple of 4 → ends on a batch boundary
     gate.setCycleCounter(dwtCycles);
 }
 
@@ -103,7 +111,7 @@ static void profileAccumulate() {
     --prof_left;
 }
 
-// 묶음 처리가 끝날 때마다 호출. 샘플 수를 다 채웠으면 결과를 출력한다.
+// Called after each batch. Prints the result once enough samples have been collected.
 static void profileBatch(uint32_t cycles) {
     ProfileStat& s = prof_batch;
     if (cycles < s.min) s.min = cycles;
@@ -145,7 +153,7 @@ static void profileBatch(uint32_t cycles) {
 }
 
 // ---------------------------------------------------------------------------
-// 출력
+// Output
 // ---------------------------------------------------------------------------
 static char* appendU32(char* p, uint32_t v) {
     char tmp[10];
@@ -183,7 +191,7 @@ static char* appendFloat(char* p, float f, int decimals) {
     return p;
 }
 
-// has_t: 묶음의 마지막 샘플만 t_us를 쓴다 (나머지는 빈칸)
+// has_t: only the last sample of a batch carries t_us (others are empty)
 static void printCsv(uint32_t seq, bool has_t, uint32_t t_us, const ImuRaw& s, const GateOutput& g,
                      uint8_t bits) {
     char buf[160];
@@ -253,10 +261,15 @@ static void printStats() {
     Serial.print(" ts_stale_irq=");         Serial.print(s.ts_stale_irq);
     Serial.print(" irq_count=");            Serial.print(s.irq_count);
     Serial.print(" gyro_clip=");            Serial.println(s.gyro_clip);
+    Serial.print("# ble conn=");            Serial.print(ble::connected() ? 1 : 0);
+    Serial.print(" data_sub=");             Serial.print(ble::dataSubscribed() ? 1 : 0);
+    Serial.print(" mtu=");                  Serial.print(ble::mtu());
+    Serial.print(" conn_interval_x125=");   Serial.print(ble::connIntervalX125());
+    Serial.print(" notify_fail=");          Serial.println(ble::notifyFail());
 }
 
 // ---------------------------------------------------------------------------
-// Serial 명령 파서
+// Serial command parser
 // ---------------------------------------------------------------------------
 static void handleLine(char* line) {
     switch (line[0]) {
@@ -295,7 +308,7 @@ static void handleLine(char* line) {
             break;
         case 'c':
             profileStart();
-            reply(true, line);   // 측정 중에는 CSV 출력을 멈춘다
+            reply(true, line);   // CSV output is paused while profiling
             break;
         case 's':
             printStats();
@@ -328,9 +341,9 @@ static void pollSerial() {
 }
 
 // ---------------------------------------------------------------------------
-// 전원 표시 LED (XIAO nRF52840 RGB LED는 active-LOW)
-//   USB 연결(VBUS 감지)  → 초록 ON
-//   배터리만 연결        → 파랑 ON
+// Power LED (XIAO nRF52840 RGB LED is active-LOW)
+//   USB connected (VBUS detected) → green ON
+//   battery only                  → blue ON
 static void powerLedInit() {
     pinMode(LED_RED, OUTPUT);
     pinMode(LED_GREEN, OUTPUT);
@@ -338,7 +351,7 @@ static void powerLedInit() {
     digitalWrite(LED_RED, HIGH);
     digitalWrite(LED_GREEN, HIGH);
     digitalWrite(LED_BLUE, HIGH);
-    // 부팅 표시: 빨강 3회 깜빡임
+    // Boot indication: red blinks 3 times
     for (int i = 0; i < 3; i++) {
         digitalWrite(LED_RED, LOW);  delay(150);
         digitalWrite(LED_RED, HIGH); delay(150);
@@ -361,11 +374,10 @@ static void powerLedUpdate() {
 
 void setup() {
     powerLedInit();
-    // USB 없이 배터리로 켜도 멈추지 않도록 Serial 연결을 기다리지 않는다
+    // Do not wait for Serial so the device also runs on battery without USB
     Serial.begin(kSerialBaud);
     timebase_init();
 
-    // Haptic_Init()의 Wire.begin()이 I2C 클럭을 100 kHz로 되돌리므로 IMU보다 먼저
     Haptic_Init();
     if (!imuInit()) {
         err_code = kErrImuInit;
@@ -373,13 +385,128 @@ void setup() {
         Serial.println("# IMU init failed, retrying every 1 s");
     }
 
-    Serial.println("# Tremor watch FW (spec v1.1, BLE_SPEC S1: IMU FIFO)");
+    device_id = ((uint64_t)NRF_FICR->DEVICEID[1] << 32) | NRF_FICR->DEVICEID[0];
+    ble::begin(device_id);
+
+    Serial.println("# Tremor watch FW (spec v1.1, BLE_SPEC S2: BLE data + GET_INFO + PING)");
     printParams();
 }
 
-// profiling: 이 묶음이 계측 대상 (cyc0 = imuPoll 직전 CYCCNT, FIFO 읽기 포함)
+// ---------------------------------------------------------------------------
+// BLE (BLE_SPEC S2). The state machine and remaining commands move to device_state in S3.
+// ---------------------------------------------------------------------------
+static bool mtuOk() { return ble::mtu() >= icd::kMinMtu; }
+
+static uint8_t bleErrCode() {
+    if (err_code != kErrNone) return err_code;
+    if (ble::connected() && !mtuOk() && millis() - connected_ms >= kMtuGraceMs) return icd::ERR_MTU_LOW;
+    return icd::ERR_NONE;
+}
+
+// S2: STREAMING when subscribed and MTU is sufficient. STREAM command comes in S3.
+static uint8_t deviceState() {
+    return (ble::dataSubscribed() && mtuOk()) ? icd::STATE_STREAMING : icd::STATE_IDLE;
+}
+
+static uint8_t deviceFlags() {
+    uint8_t f = 0;
+    if (gate.cfgValid()) f |= icd::FLAG_CFG_VALID;
+    return f;
+}
+
+static void sendDataPacket(const ImuBatch& b, const uint8_t* bits, const GateOutput& g_last) {
+    if (deviceState() == icd::STATE_IDLE) return;
+    icd::DataPkt p;
+    p.pkt_type = icd::kPktTypeData;
+    p.n = icd::kSamplesPerPkt;
+    p.seq0 = b.seq0;
+    p.t_us = b.t_us;
+    p.state = deviceState();
+    p.mode = (uint8_t)hctrl.mode();
+    p.cfg_ver = cfg_ver;
+    p.trial_id = 0;
+    p.flags = deviceFlags();
+    for (int i = 0; i < icd::kSamplesPerPkt; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            p.s[i].g[k] = b.s[i].g[k];
+            p.s[i].a[k] = b.s[i].a[k];
+        }
+        p.s[i].bits = bits[i];
+    }
+    p.feat[0] = icd::scaleSat(g_last.A, icd::kScaleA);
+    p.feat[1] = icd::scaleSat(g_last.C, icd::kScaleC);
+    p.feat[2] = icd::scaleSat(g_last.r, icd::kScaleR);
+    p.feat[3] = icd::scaleSat(g_last.D, icd::kScaleD);
+    p.feat[4] = icd::scaleSat(g_last.f_acf, icd::kScaleFacf);
+    ble::sendData(p);
+}
+
+static void sendStatus() {
+    const ImuStats& s = imuStats();
+    icd::StatusPkt st = {};
+    st.state = deviceState();
+    st.mode = (uint8_t)hctrl.mode();
+    st.cfg_ver = cfg_ver;
+    st.trial_id = 0;
+    st.flags = deviceFlags();
+    st.err_code = bleErrCode();
+    st.battery_mv = 0;    // S6
+    st.log_free_kb = 0;   // S5
+    st.seq_now = imuNextSeq();
+    st.fifo_overrun = s.fifo_overrun;
+    st.notify_fail = ble::notifyFail();
+    st.i2c_err = s.i2c_err;
+    st.gyro_clip = s.gyro_clip;
+    st.conn_interval_x125 = ble::connIntervalX125();
+    st.mtu = ble::mtu();
+    ble::sendStatus(st);
+}
+
+static void handleCtrl(const ble::CtrlMsg& m) {
+    const uint8_t cmd = m.data[0], req = m.data[1];
+    const uint8_t nargs = m.len - 2;
+    switch (cmd) {
+        case icd::CMD_GET_INFO: {
+            if (nargs != 0) {
+                ble::sendResp(req, cmd, icd::RS_BAD_LEN);
+                return;
+            }
+            icd::InfoPayload info;
+            info.icd_ver = icd::kIcdVersion;
+            for (int i = 0; i < 3; ++i) info.fw_ver[i] = kFwVersion[i];
+            info.build_hash = BUILD_HASH;
+            info.device_id = device_id;
+            info.gyro_fs_dps = kGyroRangeDps;
+            info.acc_fs_g = kAccelRangeG;
+            info.odr_hz = kImuOdrHz;
+            info.n_per_pkt = icd::kSamplesPerPkt;
+            ble::sendResp(req, cmd, icd::RS_OK, &info, sizeof(info));
+            return;
+        }
+        default:   // remaining commands in S3
+            ble::sendResp(req, cmd, icd::RS_UNKNOWN_CMD);
+            return;
+    }
+}
+
+static void serviceBle() {
+    const bool c = ble::connected();
+    if (c && !was_connected) connected_ms = millis();
+    was_connected = c;
+
+    ble::CtrlMsg m;
+    while (ble::popCtrl(&m)) handleCtrl(m);
+
+    static uint32_t last_status_ms = 0;
+    if (millis() - last_status_ms >= 1000) {
+        last_status_ms = millis();
+        sendStatus();
+    }
+}
+
+// profiling: this batch is measured (cyc0 = CYCCNT just before imuPoll, includes FIFO read)
 static void processBatch(const ImuBatch& b, bool profiling, uint32_t cyc0) {
-    if (b.discontinuity) gate.reset();   // overrun·재초기화로 샘플이 끊겼다
+    if (b.discontinuity) gate.reset();   // samples were interrupted by overrun or re-init
 
     GateOutput g[kSamplesPerBatch];
     uint8_t bits[kSamplesPerBatch];
@@ -393,7 +520,9 @@ static void processBatch(const ImuBatch& b, bool profiling, uint32_t cyc0) {
     }
     if (profiling) profileBatch(dwtCycles() - cyc0);
 
-    if (prof_left == 0) {   // 계측 중에는 CSV를 끈다 (Serial 출력이 시간을 왜곡)
+    sendDataPacket(b, bits, g[kSamplesPerBatch - 1]);
+
+    if (prof_left == 0) {   // CSV is off while profiling (Serial output would skew timing)
         for (int i = 0; i < kSamplesPerBatch; ++i) {
             const bool last = (i == kSamplesPerBatch - 1);
             printCsv(b.seq0 + i, last, b.t_us, b.s[i], g[i], bits[i]);
@@ -404,6 +533,7 @@ static void processBatch(const ImuBatch& b, bool profiling, uint32_t cyc0) {
 void loop() {
     powerLedUpdate();
     pollSerial();
+    serviceBle();
 
     if (err_code == kErrImuInit) {
         Haptic_Drive(false);

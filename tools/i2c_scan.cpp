@@ -1,5 +1,5 @@
-// I2C 스캐너 (진단용). 빌드에 포함되지 않는다.
-// 쓰려면 src/main.cpp 대신 이 파일을 src/에 두고 업로드한다.
+// I2C scanner (diagnostic). Not part of the build.
+// To use it, put this file in src/ instead of src/main.cpp and upload.
 #include <Arduino.h>
 #include <Wire.h>
 
@@ -9,17 +9,17 @@ void setup() {
     delay(1000);
 
     pinMode(D1, OUTPUT);
-    digitalWrite(D1, HIGH);   // DRV EN — 스캔 전에 반드시 깨워둠
+    digitalWrite(D1, HIGH);   // DRV EN — must be awake before scanning
     delay(10);
 
     Wire.begin();
-    Wire.setClock(100000);    // 100kHz 명시
+    Wire.setClock(100000);    // explicitly 100 kHz
     delay(50);
 
     Serial.println("Scanning...");
 
     Serial.print("D1 read-back: ");
-    Serial.println(digitalRead(D1));  // HIGH면 1, 아니면 0
+    Serial.println(digitalRead(D1));  // 1 if HIGH, else 0
 }
 
 void loop() {

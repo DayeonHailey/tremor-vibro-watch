@@ -5,22 +5,22 @@
 namespace {
 
 constexpr float kPi = 3.14159265f;
-constexpr float kQ1 = 0.5412f;   // 4차 Butterworth 2단 분해
+constexpr float kQ1 = 0.5412f;   // 4th-order Butterworth split into 2 stages
 constexpr float kQ2 = 1.3066f;
 
-// Stage 3 lag 탐색 하한 주파수. 명세의 ceil(fs/4)이면 4 Hz tremor(T = 26)가 탐색 경계에
-// 걸려 노이즈에 따라 피크가 27로 밀리면 검출에 실패하고, §11의 f0 범위(3.5–12 Hz)도 못 덮는다.
+// Lower frequency bound for the Stage 3 lag search. With the spec's ceil(fs/4), a 4 Hz tremor (T = 26) sits on
+// the search boundary; if noise pushes the peak to 27, detection fails, and the §11 f0 range (3.5–12 Hz) is not covered.
 constexpr float kAcfSearchLoHz = 3.5f;
-// 주기 배수 보정: 가장 높은 국소 최대의 이 비율 이상인 첫(최단 lag) 국소 최대를 피크로 한다.
-// 8 Hz 이상이면 T와 2T가 둘 다 범위 안에 들어와서 r(2T) ≥ r(T)가 되면 D가 0 근처로 무너진다.
+// Period-multiple correction: the first (shortest-lag) local maximum at or above this fraction of the highest one is the peak.
+// Above 8 Hz both T and 2T fall in range; if r(2T) ≥ r(T), D collapses toward 0.
 constexpr float kPeakRatio = 0.9f;
-// 증분 합에 들고 난 에너지가 창 에너지의 이 배를 넘으면 lap 전이라도 재합산한다.
-// 큰 신호가 빠져나간 직후 작은 신호 기준으로 float 상쇄 오차가 커지는 것을 막는다.
+// If energy added/removed in the incremental sums exceeds this multiple of the window energy, re-sum before the lap ends.
+// Prevents float cancellation error from growing relative to a small signal right after a large one leaves the window.
 constexpr float kChurnLimit = 16.0f;
-// churn 한계를 넘었을 때 샘플당 재합산할 lag 수 (lag 29개면 약 8샘플에 한 바퀴)
+// Lags re-summed per sample once the churn limit is exceeded (29 lags → one pass in ~8 samples)
 constexpr int kBurstRefresh = 4;
 
-bool inRange(float v, float lo, float hi) { return v >= lo && v <= hi; }   // NaN은 거부
+bool inRange(float v, float lo, float hi) { return v >= lo && v <= hi; }   // rejects NaN
 
 bool schmitt(bool state, float v, float on, float off) {
     return state ? (v >= off) : (v >= on);
@@ -60,7 +60,7 @@ void Biquad::setBandpass(float f0, float fs, float q) {
 }
 
 float Biquad::prime(float in) {
-    // DC 정상 상태: y = H(1)·in, 그 y를 내는 DF2T 상태를 역산
+    // DC steady state: y = H(1)·in, then solve for the DF2T state that produces that y
     float y = (b0_ + b1_ + b2_) / (1.0f + a1_ + a2_) * in;
     z1_ = y - b0_ * in;
     z2_ = b2_ * in - a2_ * y;
@@ -116,7 +116,7 @@ bool GateParams_validate(const GateParams& p) {
     if (W < 4 || W > TremorGate::kMaxWin) return false;
     if (N > TremorGate::kMaxWin) return false;
     if (kmin < 2 || kmax + 1 > TremorGate::kMaxLag) return false;
-    if (N < kmax + 3) return false;   // 최대 lag에서도 겹치는 구간이 남아야 한다
+    if (N < kmax + 3) return false;   // windows must still overlap at the largest lag
     return true;
 }
 
@@ -156,7 +156,7 @@ void TremorGate::configure() {
     N_ = (int)lroundf(p_.acf_win_s * fs);
     kmin_ = (int)floorf(fs / p_.bp_hi);
     kmax_ = (int)ceilf(fs / kAcfSearchLoHz);
-    // r(T/2)와 경계의 이웃 비교에 필요한 만큼 lag 범위를 넓힌다 (§4.6)
+    // Widen the lag range as needed for r(T/2) and boundary-neighbor comparisons (§4.6)
     lag_lo_ = imax(1, kmin_ / 2 - 1);
     lag_hi_ = kmax_ + 1;
 
@@ -164,7 +164,7 @@ void TremorGate::configure() {
     release_n_ = imax(1, (int)lroundf(p_.release_s * fs));
     alpha_ = 1.0f - expf(-1.0f / (p_.power_tau_s * fs));
 
-    // 필터 안정화: 대역통과 하한 2주기, power EMA 3τ 중 긴 쪽
+    // Filter settling: the longer of 2 periods of the bandpass low cutoff and 3τ of the power EMA
     float settle_s = 2.0f / p_.bp_lo;
     if (3.0f * p_.power_tau_s > settle_s) settle_s = 3.0f * p_.power_tau_s;
     warmup_n_ = imax(imax(W_, N_), (int)ceilf(settle_s * fs));
@@ -216,7 +216,7 @@ const GateOutput& TremorGate::update(const Vec3& g) {
         t = now;
     };
 
-    // --- 공통 전처리: 축별 4–12 Hz 대역통과 (§4.2) ---
+    // --- Common preprocessing: per-axis 4–12 Hz bandpass (§4.2) ---
     if (!primed_) {
         bp_[0].prime(g.x);
         bp_[1].prime(g.y);
@@ -234,7 +234,7 @@ const GateOutput& TremorGate::update(const Vec3& g) {
     he_[pos_] = he_[pos_ + kRing] = e;
     mark(0);
 
-    // --- Stage 1: 스펙트럼 집중도 (§4.4) ---
+    // --- Stage 1: spectral concentration (§4.4) ---
     pb_ += alpha_ * (e - pb_);
     if (p_.f0 > 0.0f) {
         float u = nb_[0].process(x), v = nb_[1].process(y), w = nb_[2].process(z);
@@ -246,9 +246,9 @@ const GateOutput& TremorGate::update(const Vec3& g) {
     }
     mark(1);
 
-    // --- Stage 2: 창 RMS (§4.5) ---
+    // --- Stage 2: windowed RMS (§4.5) ---
     rms_sum_ += e - he_[idx(W_)];
-    if (++rms_lap_ >= W_) {   // 한 바퀴마다 재합산해서 누적 오차 제거
+    if (++rms_lap_ >= W_) {   // re-sum once per lap to remove accumulated error
         rms_lap_ = 0;
         float s = 0.0f;
         for (int j = 0; j < W_; ++j) s += he_[idx(j)];
@@ -257,11 +257,11 @@ const GateOutput& TremorGate::update(const Vec3& g) {
     out_.A = sqrtf((rms_sum_ > 0.0f ? rms_sum_ : 0.0f) / (float)W_);
     mark(2);
 
-    // --- Stage 3: 벡터 정규화 ACF (§4.6) ---
+    // --- Stage 3: vector-normalized ACF (§4.6) ---
     stage3();
     mark(3);
 
-    // --- 판정 (§4.3, §4.7) ---
+    // --- Decision (§4.3, §4.7) ---
     const GateParams& p = p_;
     s1_  = schmitt(s1_, out_.C, p.C_on, p.C_off);
     s2_  = schmitt(s2_, out_.A, p.theta_on, p.theta_on * p.theta_off_frac);
@@ -299,8 +299,8 @@ const GateOutput& TremorGate::update(const Vec3& g) {
 }
 
 float TremorGate::lagExact(int k) const {
-    // 창 안의 곱 x[n−j]·x[n−j−k], j = 0..N−k−1 을 미러 버퍼에서 연속 구간으로 합산.
-    // back b 샘플은 인덱스 pos_ + kRing − b.
+    // Sum products x[n−j]·x[n−j−k], j = 0..N−k−1 within the window as a contiguous range of the mirror buffer.
+    // The sample b back is at index pos_ + kRing − b.
     const int len = N_ - k;
     const int hi = pos_ + kRing;   // back 0
     const int lo = hi - (len - 1);  // back len−1
@@ -310,7 +310,7 @@ float TremorGate::lagExact(int k) const {
     const float* bx = ax - k;
     const float* by = ay - k;
     const float* bz = az - k;
-    // 누적기 4개로 의존성 체인을 끊는다 (FPU 파이프라인 활용)
+    // Four accumulators break the dependency chain (uses the FPU pipeline)
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     int i = 0;
     for (; i + 1 < len; i += 2) {
@@ -324,27 +324,27 @@ float TremorGate::lagExact(int k) const {
 }
 
 void TremorGate::refreshLags(int n) {
-    // 한꺼번에 전 lag를 재합산하면 그 샘플만 수만 cycle이 걸린다 (T10 최대값의 원인).
-    // 대신 샘플마다 lag 몇 개씩 돌아가며 정확한 값으로 덮어써서 누적 오차를 끊는다.
-    // lag 하나는 (lag_hi − lag_lo + 1)/n 샘플마다 갱신된다.
+    // Re-summing all lags at once costs tens of thousands of cycles on that one sample (the cause of the T10 max).
+    // Instead, overwrite a few lags per sample with exact values, round-robin, to cut accumulated error.
+    // Each lag is refreshed every (lag_hi − lag_lo + 1)/n samples.
     for (int i = 0; i < n; ++i) {
         lag_sum_[acf_rr_] = lagExact(acf_rr_);
         if (++acf_rr_ > lag_hi_) {
             acf_rr_ = lag_lo_;
-            acf_churn_ = 0.0f;   // 한 바퀴 돌았으면 모든 lag가 새 값
+            acf_churn_ = 0.0f;   // after a full pass every lag holds a fresh value
         }
     }
 }
 
 void TremorGate::stage3() {
-    // 증분 갱신: 새 곱 x[n]·x[n-k]를 더하고, 창을 벗어난 x[n-N+k]·x[n-N]을 뺀다
+    // Incremental update: add the new product x[n]·x[n-k], subtract x[n-N+k]·x[n-N] that left the window
     for (int k = lag_lo_; k <= lag_hi_; ++k) {
         lag_sum_[k] += dotBack(0, k) - dotBack(N_ - k, N_);
     }
     acf_churn_ += he_[pos_] + he_[idx(N_)];
 
-    // E1(k) = 최신 N−k샘플, E2(k) = 가장 오래된 N−k샘플의 에너지.
-    // 전체에서 빼지 않고 양 끝에서 직접 누적한다 (큰 버스트가 한쪽에 몰렸을 때 상쇄 오차 방지).
+    // E1(k) = energy of the newest N−k samples, E2(k) = energy of the oldest N−k samples.
+    // Accumulated directly at both ends rather than subtracted from the total (avoids cancellation when a large burst sits at one end).
     float tail = 0.0f, head = 0.0f;
     for (int m = 1; m <= N_; ++m) {
         tail += he_[idx(m - 1)];
@@ -357,7 +357,7 @@ void TremorGate::stage3() {
     }
     const float e_tot = tail;
 
-    // 평소엔 샘플당 1개, 큰 에너지가 들고 나서 상쇄 오차가 커질 수 있으면 빨리 한 바퀴 돈다
+    // Normally 1 per sample; cycle quickly when large energy has entered/left and cancellation error may grow
     refreshLags(acf_churn_ > kChurnLimit * e_tot ? kBurstRefresh : 1);
 
     for (int k = lag_lo_; k <= lag_hi_; ++k) {
@@ -366,8 +366,8 @@ void TremorGate::stage3() {
         r_[k] = r > 1.0f ? 1.0f : (r < -1.0f ? -1.0f : r);
     }
 
-    // [k_min, k_max] 안의 국소 최대. 이웃은 넓힌 범위에서 비교하므로
-    // 단조 감소·증가하는 경계값은 피크가 되지 않는다.
+    // Local maxima within [k_min, k_max]. Neighbors are compared in the widened range, so
+    // monotonically decreasing/increasing boundary values are not peaks.
     float r_max = -2.0f;
     for (int k = kmin_; k <= kmax_; ++k) {
         if (r_[k] >= r_[k - 1] && r_[k] >= r_[k + 1] && r_[k] > r_max) r_max = r_[k];

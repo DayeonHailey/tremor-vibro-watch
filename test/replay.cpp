@@ -1,12 +1,12 @@
-// CSV 녹화 데이터를 게이트에 통과시켜 결과를 출력한다 (FIRMWARE_SPEC §9).
+// Feed recorded CSV data through the gate and print the results (FIRMWARE_SPEC §9).
 //
-//   replay <in.csv> [필드=값 ...] > out.csv
-//   예: replay session01.csv f0=5.2 theta_on=3.1 C_on=0.6
+//   replay <in.csv> [field=value ...] > out.csv
+//   e.g. replay session01.csv f0=5.2 theta_on=3.1 C_on=0.6
 //
-// 입력: 헤더 줄에 gx, gy, gz 열이 있는 CSV (펌웨어 Serial 출력 그대로 가능, '#' 줄은 무시).
-//       seq 열이 있으면 그대로 옮기고, 없으면 행 번호를 쓴다.
-// 출력: seq,bits,A,C,r,D,f_acf  (stdout) / 비트별 ON 비율 요약 (stderr)
-// 파라미터는 펌웨어와 같은 GateParams_set 규칙으로 검사한다.
+// Input: CSV whose header row has gx, gy, gz columns (firmware Serial output works as-is; '#' lines are ignored).
+//        If a seq column exists it is copied through; otherwise the row number is used.
+// Output: seq,bits,A,C,r,D,f_acf (stdout) / per-bit ON ratio summary (stderr)
+// Parameters are validated with the same GateParams_set rules as the firmware.
 
 #include <cstdio>
 #include <cstdlib>
@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     }
     TremorGate gate;
     gate.setParams(p);
-    if (!gate.cfgValid()) std::fprintf(stderr, "warning: f0/theta_on 미설정 → CFG_VALID=0, RAW·GATE_ON은 항상 0\n");
+    if (!gate.cfgValid()) std::fprintf(stderr, "warning: f0/theta_on not set → CFG_VALID=0, RAW and GATE_ON always 0\n");
 
     FILE* f = std::fopen(argv[1], "r");
     if (!f) {
@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
             }
             continue;
         }
-        if ((int)cols.size() != (int)header.size()) {   // 끊긴 줄·헤더 반복 등
+        if ((int)cols.size() != (int)header.size()) {   // truncated line, repeated header, etc.
             ++bad;
             continue;
         }
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
     static const char* const names[8] = {"S1", "S2", "S3", "RAW", "GATE_ON", "VIB_ON", "CFG_VALID", "WARMUP"};
     std::fprintf(stderr, "%ld samples (%.1f s), %ld skipped lines\n", row, row / p.fs, bad);
     for (int b = 0; b < 8; ++b) {
-        if (b == 5) continue;   // VIB_ON은 펌웨어 쪽 비트
+        if (b == 5) continue;   // VIB_ON is a firmware-side bit
         std::fprintf(stderr, "  %-9s %6.2f%%\n", names[b], row ? 100.0 * cnt[b] / row : 0.0);
     }
     return 0;
