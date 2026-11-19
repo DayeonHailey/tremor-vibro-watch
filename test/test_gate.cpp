@@ -1,8 +1,8 @@
-// 호스트 테스트 (FIRMWARE_SPEC §9). 장치 불필요.
+// Host tests (FIRMWARE_SPEC §9). No device needed.
 //   cd test && make && ./test_gate
-// 또는: g++ -std=c++17 -O2 -I../include test_gate.cpp ../src/tremor_gate.cpp -o test_gate
+// or: g++ -std=c++17 -O2 -I../include test_gate.cpp ../src/tremor_gate.cpp -o test_gate
 //
-// 테스트 하네스는 기준값 계산에 double을 쓴다 (펌웨어 코드는 float 전용).
+// The test harness uses double for reference values (firmware code is float-only).
 
 #include <algorithm>
 #include <cmath>
@@ -17,7 +17,7 @@
 namespace {
 
 constexpr float kFs    = 104.0f;
-constexpr float kTheta = 3.0f;   // 테스트용 θ_on [deg/s]
+constexpr float kTheta = 3.0f;   // θ_on for tests [deg/s]
 constexpr double kPi   = 3.14159265358979323846;
 
 int g_failed = 0;
@@ -40,7 +40,7 @@ GateParams baseParams(float f0) {
     return p;
 }
 
-// 4–12 Hz 대역통과의 주파수 f 진폭 이득 (정상 상태 RMS 비)
+// Amplitude gain of the 4–12 Hz bandpass at frequency f (steady-state RMS ratio)
 double bandGain(float f) {
     Bandpass4 bp;
     bp.design(4.0f, 12.0f, kFs);
@@ -64,20 +64,20 @@ double percentile(std::vector<double> v, double q) {
     return v[i == 0 ? 0 : i - 1];
 }
 
-// --- 3축 자이로 합성 신호 ---------------------------------------------------
+// --- Synthetic 3-axis gyro signal ---------------------------------------------
 struct Synth {
     std::mt19937 rng;
     std::normal_distribution<float> nd{0.0f, 1.0f};
 
-    float noise_band_rms = 0.0f;   // 4–12 Hz 대역의 벡터 RMS 목표 (축마다 독립 백색)
+    float noise_band_rms = 0.0f;   // target vector RMS in the 4–12 Hz band (independent white noise per axis)
     Vec3  bias{0, 0, 0};
 
-    float tremor_rms = 0.0f;       // tremor 성분의 벡터 RMS (= 대역 RMS A에 대한 기여)
+    float tremor_rms = 0.0f;       // vector RMS of the tremor component (= contribution to band RMS A)
     float f_tremor   = 5.0f;
-    float jitter     = 0.5f;       // 위상 random walk [rad/sqrt(s)]
+    float jitter     = 0.5f;       // phase random walk [rad/sqrt(s)]
     Vec3  tdir{1, 0, 0};
 
-    float vol_amp  = 0.0f;         // 수의운동 진폭 [deg/s]
+    float vol_amp  = 0.0f;         // voluntary movement amplitude [deg/s]
     float vol_f_lo = 1.0f, vol_f_hi = 2.5f;
     Vec3  vdir{0, 1, 0};
 
@@ -93,7 +93,7 @@ struct Synth {
 
     Vec3 next() {
         const double dt = 1.0 / kFs;
-        // 대역 전력 비 = 3축 × (12−4)/(fs/2)
+        // band power ratio = 3 axes × (12−4)/(fs/2)
         const float sw = noise_band_rms / std::sqrt(3.0f * 8.0f / (kFs * 0.5f));
         tphase += 2 * kPi * f_tremor * dt + jitter * nd(rng) * std::sqrt(dt);
         const double fv = 0.5 * (vol_f_lo + vol_f_hi) + 0.5 * (vol_f_hi - vol_f_lo) * std::sin(2 * kPi * 0.07 * t);
@@ -120,7 +120,7 @@ struct BitStats {
     double frac(long v) const { return n ? (double)v / n : 0.0; }
 };
 
-// --- T0: 기본 동작 -----------------------------------------------------------
+// --- T0: basic behavior --------------------------------------------------------
 void testSanity() {
     {
         TremorGate g;
@@ -128,7 +128,7 @@ void testSanity() {
         bool ok = !g.cfgValid();
         ok = ok && GateParams_set(p, "f0", 5.0f) && g.setParams(p) && !g.cfgValid();
         ok = ok && GateParams_set(p, "theta_on", kTheta) && g.setParams(p) && g.cfgValid();
-        report(ok, "T0a", "cfg_valid는 f0와 theta_on을 모두 설정해야 켜짐");
+        report(ok, "T0a", "cfg_valid turns on only when both f0 and theta_on are set");
     }
     {
         GateParams p = baseParams(5.0f);
@@ -136,7 +136,7 @@ void testSanity() {
                   !GateParams_set(p, "nope", 1.0f) && !GateParams_set(p, "acf_win_s", 0.2f) &&
                   !GateParams_set(p, "theta_on", NAN) && p.f0 == 5.0f && p.C_off == 0.40f;
         ok = ok && GateParams_set(p, "C_on", 0.6f) && p.C_on == 0.6f;
-        report(ok, "T0b", "범위 밖 값·없는 필드는 거부하고 기존값 유지");
+        report(ok, "T0b", "out-of-range values and unknown fields are rejected, existing values kept");
     }
     {
         TremorGate g;
@@ -154,17 +154,17 @@ void testSanity() {
         const GateOutput& o = g.output();
         bool ok = warm_ok && o.C > 0.95f && o.r > 0.95f && o.D > 1.8f && std::fabs(o.f_acf - 5.0f) < 0.2f &&
                   (o.bits & GateBit::GATE_ON) && !(o.bits & GateBit::WARMUP);
-        report(ok, "T0c", "순수 5 Hz: C=%.3f r=%.3f D=%.3f f_acf=%.2f, warmup %d샘플 강제 OFF=%s", o.C, o.r, o.D,
+        report(ok, "T0c", "pure 5 Hz: C=%.3f r=%.3f D=%.3f f_acf=%.2f, forced OFF for %d warmup samples=%s", o.C, o.r, o.D,
                o.f_acf, g.warmupSamples(), warm_ok ? "yes" : "no");
 
         g.reset();
         uint8_t b = g.update(s.next()).bits;
         report((b & GateBit::WARMUP) && g.params().f0 == 5.0f && g.cfgValid(), "T0d",
-               "reset()은 파라미터 유지, 워밍업 재진입");
+               "reset() keeps parameters and re-enters warmup");
     }
 }
 
-// --- T1: 필터 응답 -----------------------------------------------------------
+// --- T1: filter response --------------------------------------------------------
 void testFilter() {
     const float freqs[] = {4.0f, 6.0f, 8.0f, 12.0f};
     const float expect[] = {-3.0f, NAN, 0.0f, -3.0f};
@@ -176,12 +176,12 @@ void testFilter() {
         if (!std::isnan(expect[i])) ok = ok && std::fabs(db - expect[i]) <= 1.0;
         len += std::snprintf(msg + len, sizeof(msg) - len, "%g Hz %.2f dB  ", freqs[i], db);
     }
-    report(ok, "T1", "%s(경계 −3±1, 중심 0±1)", msg);
+    report(ok, "T1", "%s(edges −3±1, center 0±1)", msg);
 }
 
-// --- T2: 지연 ----------------------------------------------------------------
-// tremor 진폭 1.5θ는 대역통과 후 RMS 기준이다. θ가 캘리브레이션에서 같은 필터 출력
-// (A_post, §11)으로 정해지므로, 대역 경계(4 Hz, −3 dB)에서는 원신호를 이득만큼 키운다.
+// --- T2: latency -----------------------------------------------------------------
+// The tremor amplitude 1.5θ is the post-bandpass RMS. Since θ is set from the same filter output during
+// calibration (A_post, §11), the raw signal is scaled up by the gain at the band edge (4 Hz, −3 dB).
 void testLatency() {
     const float f0s[] = {4, 5, 6, 8, 10};
     const int seeds = 100;
@@ -220,16 +220,16 @@ void testLatency() {
             all.push_back(lat.back());
         }
         const double p95 = percentile(lat, 0.95);
-        report(p95 <= 0.75 && pre_on == 0, "T2", "f0=%4.1f Hz onset p50=%.3f p95=%.3f max=%.3f s | offset p50=%.3f p95=%.3f s | 사전 오탐 %d/%d",
+        report(p95 <= 0.75 && pre_on == 0, "T2", "f0=%4.1f Hz onset p50=%.3f p95=%.3f max=%.3f s | offset p50=%.3f p95=%.3f s | early false ON %d/%d",
                f0, percentile(lat, 0.5), p95, percentile(lat, 1.0), percentile(off, 0.5), percentile(off, 0.95),
                pre_on, seeds);
-        std::printf("            stage 첫 통과 p95: S1 %.3f  S2 %.3f  S3 %.3f s\n", percentile(st_lat[0], 0.95),
+        std::printf("            stage first-pass p95: S1 %.3f  S2 %.3f  S3 %.3f s\n", percentile(st_lat[0], 0.95),
                     percentile(st_lat[1], 0.95), percentile(st_lat[2], 0.95));
     }
-    report(percentile(all, 0.95) <= 0.75, "T2", "전체 onset p95=%.3f s (목표 ≤ 0.75)", percentile(all, 0.95));
+    report(percentile(all, 0.95) <= 0.75, "T2", "overall onset p95=%.3f s (target ≤ 0.75)", percentile(all, 0.95));
 }
 
-// --- 공통: 일정 시간 돌리고 비트 통계 ------------------------------------------
+// --- Common: run for a fixed time and collect bit statistics ---------------------
 BitStats runFor(TremorGate& g, Synth& s, float seconds) {
     BitStats st;
     const int n = (int)(seconds * kFs);
@@ -240,7 +240,7 @@ BitStats runFor(TremorGate& g, Synth& s, float seconds) {
     return st;
 }
 
-// --- T3: 노이즈만 (θ 미만) ---------------------------------------------------
+// --- T3: noise only (below θ) -----------------------------------------------------
 void testNoiseFalseAlarm() {
     TremorGate g;
     g.setParams(baseParams(5.0f));
@@ -248,11 +248,11 @@ void testNoiseFalseAlarm() {
     s.noise_band_rms = 0.6f * kTheta;
     s.bias = Vec3{1.5f, -2.0f, 0.7f};
     BitStats st = runFor(g, s, 600.0f);
-    report(st.frac(st.on) < 0.01, "T3", "노이즈 0.6θ 10분: GATE_ON %.4f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)",
+    report(st.frac(st.on) < 0.01, "T3", "noise 0.6θ 10 min: GATE_ON %.4f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)",
            100 * st.frac(st.on), 100 * st.frac(st.s1), 100 * st.frac(st.s2), 100 * st.frac(st.s3));
 }
 
-// --- T4: 수의운동 (대역 외, 큰 진폭) ------------------------------------------
+// --- T4: voluntary movement (out of band, large amplitude) ------------------------
 void testVoluntary() {
     const float f0s[] = {4.0f, 5.0f, 8.0f};
     for (float f0 : f0s) {
@@ -265,12 +265,12 @@ void testVoluntary() {
         s.vol_f_hi = 2.5f;
         s.vdir = s.unitRandom();
         BitStats st = runFor(g, s, 120.0f);
-        report(st.frac(st.on) < 0.01, "T4", "f0=%g, 수의운동 100 deg/s 1–2.5 Hz 2분: GATE_ON %.3f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)",
+        report(st.frac(st.on) < 0.01, "T4", "f0=%g, voluntary 100 deg/s 1–2.5 Hz 2 min: GATE_ON %.3f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)",
                f0, 100 * st.frac(st.on), 100 * st.frac(st.s1), 100 * st.frac(st.s2), 100 * st.frac(st.s3));
     }
 }
 
-// --- T5: tremor + 수의운동 ---------------------------------------------------
+// --- T5: tremor + voluntary movement -----------------------------------------------
 void testTremorPlusVoluntary() {
     const float f0s[] = {4.0f, 6.0f, 10.0f};
     for (float f0 : f0s) {
@@ -288,17 +288,17 @@ void testTremorPlusVoluntary() {
         runFor(g, s, 3.0f);
         BitStats st = runFor(g, s, 60.0f);
         bool ok = st.frac(st.on) >= 0.95 && st.frac(st.s1) >= 0.95 && st.frac(st.s2) >= 0.95 && st.frac(st.s3) >= 0.95;
-        report(ok, "T5", "f0=%g, tremor 2θ + 수의운동 40 deg/s 1–2 Hz: GATE_ON %.1f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)",
+        report(ok, "T5", "f0=%g, tremor 2θ + voluntary 40 deg/s 1–2 Hz: GATE_ON %.1f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)",
                f0, 100 * st.frac(st.on), 100 * st.frac(st.s1), 100 * st.frac(st.s2), 100 * st.frac(st.s3));
     }
 }
 
-// --- T6: 축 불변성 -----------------------------------------------------------
+// --- T6: axis invariance -----------------------------------------------------------
 struct Mat3 { float m[3][3]; };
 
 Mat3 randomRotation(std::mt19937& rng) {
     std::uniform_real_distribution<double> u(0.0, 1.0);
-    double u1 = u(rng), u2 = u(rng), u3 = u(rng);   // Shoemake 균일 사원수
+    double u1 = u(rng), u2 = u(rng), u3 = u(rng);   // Shoemake uniform quaternion
     double a = std::sqrt(1 - u1), b = std::sqrt(u1);
     double w = a * std::sin(2 * kPi * u2), x = a * std::cos(2 * kPi * u2);
     double y = b * std::sin(2 * kPi * u3), z = b * std::cos(2 * kPi * u3);
@@ -325,7 +325,7 @@ std::vector<uint8_t> runSequence(const std::vector<Vec3>& seq, const Mat3* rot) 
 }
 
 void testAxisInvariance() {
-    // 센서 z축(= v0의 중력 수직 방향)으로만 떠는 tremor를 진폭을 바꿔 가며 on/off
+    // Tremor only along the sensor z axis (gravity-normal direction of v0), toggled on/off at varying amplitude
     Synth s(61);
     s.noise_band_rms = 0.3f * kTheta;
     s.bias = Vec3{2.0f, -1.0f, 0.5f};
@@ -359,10 +359,10 @@ void testAxisInvariance() {
     }
     const double on_frac = (double)ref_on / valid;
     report(worst >= 0.95 && on_frac > 0.2 && on_frac < 0.8, "T6",
-           "z축 tremor, 임의 회전 20개: RAW 일치율 최저 %.3f%% (기준 RAW ON %.1f%%)", 100 * worst, 100 * on_frac);
+           "z-axis tremor, 20 random rotations: min RAW agreement %.3f%% (reference RAW ON %.1f%%)", 100 * worst, 100 * on_frac);
 }
 
-// --- T7: 증분 ACF vs 배치 ----------------------------------------------------
+// --- T7: incremental ACF vs batch ---------------------------------------------------
 double maxAcfError(const TremorGate& g) {
     const int N = g.acfWindow();
     std::vector<Vec3> w(N);
@@ -396,7 +396,7 @@ void testIncrementalAcf() {
     double worst = 0, worst_last = 0;
     long checks = 0;
     for (long n = 0; n < total; ++n) {
-        if (n % seg == 0) {   // 10초마다 장면 전환: 조용함 / tremor / 수의운동 / 혼합
+        if (n % seg == 0) {   // scene change every 10 s: quiet / tremor / voluntary / mixed
             int kind = (int)(u(s.rng) * 4);
             s.noise_band_rms = 0.2f + 2.0f * u(s.rng);
             s.tremor_rms = (kind == 1 || kind == 3) ? 1.0f + 19.0f * u(s.rng) : 0.0f;
@@ -414,11 +414,11 @@ void testIncrementalAcf() {
         worst = std::max(worst, e);
         if (last_minute) worst_last = std::max(worst_last, e);
     }
-    report(worst <= 1e-4, "T7", "1시간, 검사 %ld회: |r_증분 − r_배치| 최대 %.2e (마지막 1분 %.2e, 기준 1e-4)", checks, worst,
+    report(worst <= 1e-4, "T7", "1 h, %ld checks: max |r_incr − r_batch| %.2e (last 1 min %.2e, limit 1e-4)", checks, worst,
            worst_last);
 }
 
-// --- T8: 광대역 노이즈 (θ 초과) ----------------------------------------------
+// --- T8: broadband noise (above θ) -------------------------------------------------
 void testBroadbandNoise() {
     const float f0s[] = {5.0f, 8.0f};
     for (float f0 : f0s) {
@@ -427,12 +427,12 @@ void testBroadbandNoise() {
         Synth s(81 + (unsigned)f0);
         s.noise_band_rms = 2.0f * kTheta;
         BitStats st = runFor(g, s, 300.0f);
-        report(st.frac(st.on) < 0.05, "T8", "f0=%g, 광대역 노이즈 2θ 5분: GATE_ON %.3f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)", f0,
+        report(st.frac(st.on) < 0.05, "T8", "f0=%g, broadband noise 2θ 5 min: GATE_ON %.3f%% (S1 %.1f%% S2 %.1f%% S3 %.1f%%)", f0,
                100 * st.frac(st.on), 100 * st.frac(st.s1), 100 * st.frac(st.s2), 100 * st.frac(st.s3));
     }
 }
 
-// --- T9: 모드 로직 -----------------------------------------------------------
+// --- T9: mode logic -----------------------------------------------------------------
 void testModes() {
     struct Case { CondMode mode; bool gate, cfg, expect; };
     const Case cases[] = {
@@ -457,7 +457,7 @@ void testModes() {
     ok = ok && !hc.setMode(CondMode::ADAPTIVE) && hc.mode() == CondMode::CONSTANT;
     hc.setTrialActive(false);
     ok = ok && hc.setMode(CondMode::ADAPTIVE);
-    report(ok, "T9", "3모드 × 게이트·CFG_VALID 표, SHAM(1) 거부, trial 중 모드 잠금");
+    report(ok, "T9", "3 modes × gate/CFG_VALID table, SHAM(1) rejected, mode locked during trial");
 }
 
 }  // namespace

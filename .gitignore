@@ -6,3 +6,9 @@
 test/test_gate
 test/replay
 test/*.exe
+logs/
+__pycache__/
+
+# PC test tools / logs (local only)
+tools/*.py
+!tools/build_hash.py

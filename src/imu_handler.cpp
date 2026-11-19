@@ -6,31 +6,35 @@
 
 static LSM6DS3 myIMU(I2C_MODE, kImuI2cAddr);
 
-// --- LSM6DS3TR-C 레지스터 ---
-static constexpr uint8_t kRegFifoCtrl1  = 0x06;   // FTH[7:0] (워드 단위)
+// On the XIAO nRF52840 Sense the IMU is on the internal I2C bus (Wire1, P0.07/P0.27).
+// The library also uses Wire1 on this board via #define Wire Wire1. The DRV2605L is on the external Wire.
+static TwoWire& imuWire = Wire1;
+
+// --- LSM6DS3TR-C registers ---
+static constexpr uint8_t kRegFifoCtrl1  = 0x06;   // FTH[7:0] (in words)
 static constexpr uint8_t kRegFifoCtrl2  = 0x07;   // FTH[10:8]
 static constexpr uint8_t kRegFifoCtrl3  = 0x08;   // DEC_FIFO_GYRO[5:3], DEC_FIFO_XL[2:0]
 static constexpr uint8_t kRegFifoCtrl4  = 0x09;
 static constexpr uint8_t kRegFifoCtrl5  = 0x0A;   // ODR_FIFO[6:3], FIFO_MODE[2:0]
 static constexpr uint8_t kRegInt1Ctrl   = 0x0D;
 static constexpr uint8_t kRegCtrl3C     = 0x12;
-static constexpr uint8_t kRegFifoStatus = 0x3A;   // STATUS1..4 연속
-static constexpr uint8_t kRegFifoData   = 0x3E;   // 버스트 읽기 시 0x3F 다음 0x3E로 되돌아감
+static constexpr uint8_t kRegFifoStatus = 0x3A;   // STATUS1..4, contiguous
+static constexpr uint8_t kRegFifoData   = 0x3E;   // burst reads wrap from 0x3F back to 0x3E
 
 static constexpr uint8_t kCtrl3BDU       = 0x40;
 static constexpr uint8_t kCtrl3IfInc     = 0x04;
-static constexpr uint8_t kFifoDecNone    = 0x09;               // 자이로·가속도 모두 decimation 없음
+static constexpr uint8_t kFifoDecNone    = 0x09;               // no decimation for gyro or accel
 static constexpr uint8_t kFifoContinuous = (0x4 << 3) | 0x6;   // ODR_FIFO 104 Hz, continuous
-static constexpr uint8_t kFifoBypass     = 0x00;               // FIFO 비움
+static constexpr uint8_t kFifoBypass     = 0x00;               // empties the FIFO
 static constexpr uint8_t kInt1Fth        = 0x08;
 static constexpr uint8_t kStatus2Overrun = 0x40;
 
-static constexpr int kWordsPerSample = 6;   // FIFO 패턴: Gx Gy Gz XLx XLy XLz
+static constexpr int kWordsPerSample = 6;   // FIFO pattern: Gx Gy Gz XLx XLy XLz
 static constexpr int kBatchWords     = kWordsPerSample * kSamplesPerBatch;
-static constexpr int kBatchBytes     = kBatchWords * 2;   // 48 B (Wire 버퍼 64 B 이내)
-static_assert(kBatchBytes <= 64, "Wire RX 버퍼(64 B)를 넘는다");
+static constexpr int kBatchBytes     = kBatchWords * 2;   // 48 B (within the 64 B Wire buffer)
+static_assert(kBatchBytes <= 64, "exceeds Wire RX buffer (64 B)");
 
-// INT1 무응답 시 FIFO 상태를 직접 확인하는 간격 (정상이면 쓰이지 않음)
+// Interval for checking FIFO status directly if INT1 is silent (unused in normal operation)
 static constexpr uint32_t kFallbackPollUs = 50000;
 
 static volatile uint32_t irq_cnt = 0;
@@ -38,9 +42,9 @@ static volatile uint32_t irq_t = 0;
 
 static uint32_t seen_irq = 0;
 static uint32_t seq = 0;
-static uint32_t last_t = 0;          // 마지막으로 내보낸 묶음의 t_us
+static uint32_t last_t = 0;          // t_us of the last emitted batch
 static bool     have_last_t = false;
-static bool     more = false;        // 직전 확인에서 묶음이 하나 더 남아 있었음
+static bool     more = false;        // the last check showed at least one more batch
 static bool     discont = false;
 static uint32_t last_check_us = 0;
 static ImuStats stats = {};
@@ -51,21 +55,21 @@ static void onInt1() {
 }
 
 static bool wr(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(kImuI2cAddr);
-    Wire.write(reg);
-    Wire.write(val);
-    return Wire.endTransmission() == 0;
+    imuWire.beginTransmission(kImuI2cAddr);
+    imuWire.write(reg);
+    imuWire.write(val);
+    return imuWire.endTransmission() == 0;
 }
 
 static bool rd(uint8_t reg, uint8_t* buf, uint8_t n) {
-    Wire.beginTransmission(kImuI2cAddr);
-    Wire.write(reg);
-    if (Wire.endTransmission() != 0) return false;
-    if (Wire.requestFrom(kImuI2cAddr, n) != n) {
-        while (Wire.available()) Wire.read();
+    imuWire.beginTransmission(kImuI2cAddr);
+    imuWire.write(reg);
+    if (imuWire.endTransmission() != 0) return false;
+    if (imuWire.requestFrom(kImuI2cAddr, n) != n) {
+        while (imuWire.available()) imuWire.read();
         return false;
     }
-    for (uint8_t i = 0; i < n; ++i) buf[i] = (uint8_t)Wire.read();
+    for (uint8_t i = 0; i < n; ++i) buf[i] = (uint8_t)imuWire.read();
     return true;
 }
 
@@ -80,20 +84,20 @@ bool imuInit() {
     myIMU.settings.accelSampleRate = kImuOdrHz;
     myIMU.settings.accelBandWidth  = 50;
     if (myIMU.begin() != 0) return false;
-    Wire.setClock(kImuI2cHz);   // begin()이 Wire.begin()으로 100 kHz로 되돌리므로 그 뒤에
+    imuWire.setClock(kImuI2cHz);   // after begin(), since Wire1.begin() resets it to 100 kHz
 
     uint8_t ctrl3 = 0;
     if (!rd(kRegCtrl3C, &ctrl3, 1)) return false;
-    // BDU: 상·하위 바이트가 다른 샘플에서 오지 않게. IF_INC: 버스트 읽기
+    // BDU: high/low bytes always from the same sample. IF_INC: burst reads
     if (!wr(kRegCtrl3C, ctrl3 | kCtrl3BDU | kCtrl3IfInc)) return false;
 
-    bool ok = wr(kRegFifoCtrl5, kFifoBypass) &&
-              wr(kRegFifoCtrl1, (uint8_t)(kBatchWords & 0xFF)) &&
-              wr(kRegFifoCtrl2, (uint8_t)((kBatchWords >> 8) & 0x07)) &&
-              wr(kRegFifoCtrl3, kFifoDecNone) &&
-              wr(kRegFifoCtrl4, 0x00) &&
-              wr(kRegInt1Ctrl, kInt1Fth);
-    if (!ok) return false;
+    if (!(wr(kRegFifoCtrl5, kFifoBypass) &&
+          wr(kRegFifoCtrl1, (uint8_t)(kBatchWords & 0xFF)) &&
+          wr(kRegFifoCtrl2, (uint8_t)((kBatchWords >> 8) & 0x07)) &&
+          wr(kRegFifoCtrl3, kFifoDecNone) &&
+          wr(kRegFifoCtrl4, 0x00) &&
+          wr(kRegInt1Ctrl, kInt1Fth)))
+        return false;
 
     static bool attached = false;
     if (!attached) {
@@ -106,7 +110,7 @@ bool imuInit() {
     uint8_t back = 0;
     if (!rd(kRegFifoCtrl5, &back, 1) || back != kFifoContinuous) return false;
 
-    // 이전 상태 버림. seq는 이어간다 (재초기화 동안의 공백은 시각으로 알 수 있음)
+    // Discard previous state. seq continues (the gap during re-init is visible from timestamps)
     seen_irq = irq_cnt;
     have_last_t = false;
     more = false;
@@ -118,8 +122,8 @@ bool imuInit() {
 uint32_t imuNextSeq() { return seq; }
 const ImuStats& imuStats() { return stats; }
 
-// overrun: FIFO가 가득 차 오래된 샘플이 덮어써졌다. 남은 내용은 시각을 알 수 없으므로
-// 전부 버리고, 마지막 묶음 이후 흐른 시간만큼 seq를 건너뛴다.
+// overrun: the FIFO filled up and old samples were overwritten. The remaining contents have unknown
+// timestamps, so discard them all and skip seq by the time elapsed since the last batch.
 static void handleOverrun(uint32_t now) {
     ++stats.fifo_overrun;
     if (have_last_t) {
@@ -164,7 +168,7 @@ bool imuPoll(ImuBatch* out) {
         return false;
     }
     int words = ((st[1] & 0x0F) << 8) | st[0];
-    const int pattern = ((st[3] & 0x03) << 8) | st[2];   // 다음에 읽을 워드의 위치 (0 = Gx)
+    const int pattern = ((st[3] & 0x03) << 8) | st[2];   // position of the next word to read (0 = Gx)
     if (pattern != 0) {
         const int skip = (kWordsPerSample - pattern % kWordsPerSample) % kWordsPerSample;
         ++stats.realign;
@@ -178,20 +182,20 @@ bool imuPoll(ImuBatch* out) {
     }
     if (words < kBatchWords) {
         more = false;
-        if (fresh) seen_irq = c;   // 묶음 없는 INT1 (재정렬 직후 등)
+        if (fresh) seen_irq = c;   // INT1 with no batch (e.g. right after realignment)
         return false;
     }
 
-    // 이 묶음의 마지막 샘플 시각.
-    // INT1은 FIFO가 3→4샘플이 되는 순간 오르고, 그때 FIFO의 가장 오래된 4개가 다음에 읽을
-    // 묶음이다. 그래서 확인하지 않은 INT1 시각은 곧 이번 묶음의 시각이다. 여러 묶음이 쌓여
-    // INT1이 계속 HIGH면 새 에지가 없으므로 직전 묶음 + 4T로 외삽한다.
+    // Time of the last sample in this batch.
+    // INT1 rises when the FIFO goes from 3 to 4 samples; at that moment the 4 oldest samples are the
+    // next batch to read, so an unconsumed INT1 time is this batch's time. When several batches pile up,
+    // INT1 stays HIGH with no new edge, so extrapolate as previous batch + 4T.
     const uint32_t extrap = last_t + kSamplesPerBatch * kSamplePeriodUs;
     uint32_t t_batch;
     bool exact = false;
     if (fresh) {
         seen_irq = c;
-        // ISR이 늦게 돌아 직전 묶음의 INT1을 지금 본 경우는 버린다
+        // Discard an INT1 for the previous batch that we only see now because the ISR ran late
         if (have_last_t && (int32_t)(t - extrap) < -(int32_t)(2 * kSamplePeriodUs)) {
             ++stats.ts_stale_irq;
         } else {
@@ -204,7 +208,7 @@ bool imuPoll(ImuBatch* out) {
         if (have_last_t) {
             t_batch = extrap;
         } else {
-            // 기준 시각 없음: 가장 최근 샘플 ≈ now 로 보고 거슬러 계산
+            // No reference time: assume the newest sample ≈ now and count backwards
             const int samples = words / kWordsPerSample;
             t_batch = now - (uint32_t)(samples - kSamplesPerBatch) * kSamplePeriodUs;
         }
@@ -214,7 +218,7 @@ bool imuPoll(ImuBatch* out) {
     if (!rd(kRegFifoData, b, sizeof(b))) {
         ++stats.i2c_err;
         more = false;
-        discont = true;   // 일부만 읽혔을 수 있다 → 다음 확인에서 패턴으로 재정렬
+        discont = true;   // may have been partially read → realign by pattern on the next check
         return false;
     }
     for (int i = 0; i < kSamplesPerBatch; ++i) {

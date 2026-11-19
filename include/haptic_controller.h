@@ -1,16 +1,16 @@
 #ifndef HAPTIC_CONTROLLER_H
 #define HAPTIC_CONTROLLER_H
 
-// 조건 모드 × 게이트 → 모터 on/off (FIRMWARE_SPEC §6). 플랫폼 독립.
-// 진동 레벨은 config.h의 kVibLevel 하나로 고정이고, 여기서는 on/off만 정한다.
+// Condition mode × gate → motor on/off (FIRMWARE_SPEC §6). Platform-independent.
+// Vibration level is fixed by kVibLevel in config.h; this only decides on/off.
 
 #include <stdint.h>
 #include "tremor_gate.h"
 
-// 번호는 실험 로그·GATT 값과 묶여 있으므로 바꾸지 않는다.
+// Values are tied to experiment logs and GATT values; do not renumber.
 enum class CondMode : uint8_t {
     NO_VIB   = 0,
-    /* 1 = SHAM (예약, 구현 안 함) */
+    /* 1 = SHAM (reserved, not implemented) */
     CONSTANT = 2,
     ADAPTIVE = 3,
 };
@@ -23,7 +23,7 @@ inline bool CondMode_fromU8(uint8_t v, CondMode* out) {
 
 class HapticController {
   public:
-    // trial 진행 중에는 모드 전환을 거부한다 (trial 경계에서만 허용).
+    // Mode changes are rejected during a trial (allowed only at trial boundaries).
     bool setMode(CondMode m) {
         if (trial_active_) return false;
         mode_ = m;

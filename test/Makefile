@@ -1,6 +1,6 @@
-# 호스트 빌드 (장치 불필요). Windows는 WinLibs의 mingw32-make 사용.
-#   make          빌드
-#   make check    테스트 실행
+# Host build (no device needed). On Windows use mingw32-make from WinLibs.
+#   make          build
+#   make check    run tests
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 CPPFLAGS += -I../include
