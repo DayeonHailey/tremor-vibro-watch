@@ -12,3 +12,7 @@ __pycache__/
 # PC test tools / logs (local only)
 tools/*.py
 !tools/build_hash.py
+test/test_device
+test/test_device.cpp
+test/test_device.exe
+sessions/

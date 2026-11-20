@@ -30,7 +30,7 @@ constexpr uint32_t kBrakeMs       = 100;      // time from OFF until standby
 #define DRV_EN_PIN D1                         // DRV2605L EN (must be HIGH at boot)
 
 // --- Firmware version (GET_INFO, DIS) ---
-constexpr uint8_t  kFwVersion[3]  = {0, 2, 0};   // 0.2.0 = BLE_SPEC S2
+constexpr uint8_t  kFwVersion[3]  = {0, 4, 0};   // 0.4.0 = BLE_SPEC S4
 #ifndef BUILD_HASH
 #define BUILD_HASH 0u                             // tools/build_hash.py injects the git hash
 #endif
